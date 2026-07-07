@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Incident War Room</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">&#9679;</span>
+      <div>
+        <h1>Incident War Room</h1>
+        <p class="tagline">Auction + consensus multi-agent incident triage, benchmarked against a single-agent baseline</p>
+      </div>
+    </div>
+    <div class="mode-badge" id="mode-badge">checking mode&hellip;</div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="live">Live Run</button>
+    <button class="tab-btn" data-tab="eval">Evaluation</button>
+  </nav>
+
+  <main>
+    <section id="tab-live" class="tab-panel active">
+      <div class="controls">
+        <label for="incident-select">Incident</label>
+        <select id="incident-select"></select>
+        <button id="run-btn">Run incident</button>
+      </div>
+
+      <div id="incident-text" class="incident-text"></div>
+
+      <div class="flow">
+        <div class="flow-col wide">
+          <h2>Specialist bids</h2>
+          <div id="bids" class="card-grid"></div>
+
+          <h2>Allocation</h2>
+          <div id="allocation" class="panel"></div>
+
+          <div id="negotiation-wrap" class="hidden">
+            <h2>Negotiation</h2>
+            <div id="negotiation" class="negotiation"></div>
+          </div>
+
+          <h2>Resolution</h2>
+          <div id="resolution" class="panel"></div>
+        </div>
+
+        <div class="flow-col">
+          <h2>Baseline (single agent)</h2>
+          <div id="baseline" class="panel"></div>
+
+          <h2>Compare this incident</h2>
+          <div id="compare" class="panel"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-eval" class="tab-panel">
+      <div class="controls">
+        <button id="eval-btn">Run full evaluation (all incidents)</button>
+        <span id="eval-status"></span>
+      </div>
+      <div id="eval-summary" class="summary-grid"></div>
+      <div id="eval-table-wrap"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
