@@ -67,11 +67,26 @@ def run_multi_agent(incident: Incident, on_event: EventFn = None) -> RunResult:
     if on_event:
         on_event("resolution", resolution.model_dump())
 
-    return RunResult(incident_id=incident.id, mode="multi_agent", allocation=allocation, resolution=resolution, usage=usage_total)
+    tools_checked = [b.tool_checked for b in bids if b.tool_checked]
+    return RunResult(
+        incident_id=incident.id,
+        mode="multi_agent",
+        allocation=allocation,
+        resolution=resolution,
+        usage=usage_total,
+        tools_checked=tools_checked,
+    )
 
 
 def run_baseline_run(incident: Incident, on_event: EventFn = None) -> RunResult:
-    resolution, usage = _run_baseline_agent(incident)
+    resolution, usage, tools_checked = _run_baseline_agent(incident)
     if on_event:
-        on_event("baseline_resolution", resolution.model_dump())
-    return RunResult(incident_id=incident.id, mode="baseline", allocation=None, resolution=resolution, usage=usage)
+        on_event("baseline_resolution", {**resolution.model_dump(), "tools_checked": tools_checked})
+    return RunResult(
+        incident_id=incident.id,
+        mode="baseline",
+        allocation=None,
+        resolution=resolution,
+        usage=usage,
+        tools_checked=tools_checked,
+    )

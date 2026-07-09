@@ -16,6 +16,7 @@ now only happens when the judge itself says the evidence is genuinely unclear.
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from app.models import Bid, Claim, Incident, JudgeVerdict, NegotiationRound, Rebuttal, Resolution, Specialist, UsageStats
 from app.qwen_client import qwen_client
@@ -41,7 +42,7 @@ def judge_votes() -> int:
     calls -- the model's own reasoning isn't stably anchored to one answer, so making
     that one sample more deterministic doesn't help. Self-consistency (sample several
     times, take the majority) is the standard fix for exactly this kind of instability."""
-    return int(os.getenv("JUDGE_VOTES", "3"))
+    return int(os.getenv("JUDGE_VOTES", "5"))
 
 
 def _judge_negotiation(
@@ -52,10 +53,11 @@ def _judge_negotiation(
     resolved by an arbitrary tiebreak."""
     n = judge_votes()
     usage_total = UsageStats()
-    verdicts: list[JudgeVerdict] = []
-    for _ in range(n):
-        verdict, usage = _judge_once(incident, claims, rebuttals)
-        verdicts.append(verdict)
+    with ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(_judge_once, incident, claims, rebuttals) for _ in range(n)]
+        results = [f.result() for f in futures]
+    verdicts = [v for v, _ in results]
+    for _, usage in results:
         usage_total = usage_total + usage
 
     tally: dict[Specialist | None, int] = {}
@@ -109,7 +111,7 @@ def _judge_once(
         return {"winner": ranked[0].specialist.value, "confidence": ranked[0].confidence, "reasoning": no_reasoning}
 
     user_prompt = (
-        f"Incident: {incident.title}\n\n{incident.description}\n\n"
+        f"Incident alert: {incident.alert}\n\n"
         f"Debate transcript:\n{transcript}\n\n"
         f"Candidates: {', '.join(candidates)}\n\n"
         "Respond with JSON matching exactly this shape:\n"
@@ -149,8 +151,15 @@ def run_negotiation(incident: Incident, contested_bids: list[Bid]) -> tuple[Reso
     rounds: list[NegotiationRound] = []
 
     round1 = NegotiationRound(round_number=1)
-    for specialist, agent in agents.items():
-        claim, usage = agent.make_claim(incident, prior_confidence=initial_confidence[specialist])
+    specialists_order = list(agents.keys())
+    with ThreadPoolExecutor(max_workers=len(specialists_order)) as executor:
+        claim_results = list(
+            executor.map(
+                lambda s: agents[s].make_claim(incident, prior_confidence=initial_confidence[s]),
+                specialists_order,
+            )
+        )
+    for specialist, (claim, usage) in zip(specialists_order, claim_results):
         claims[specialist] = claim
         last_statement[specialist] = f"{claim.claim} Evidence: {'; '.join(claim.evidence)}"
         round1.claims.append(claim)
@@ -163,10 +172,18 @@ def run_negotiation(incident: Incident, contested_bids: list[Bid]) -> tuple[Reso
     while round_number <= max_rounds() and len(specialists_list) > 1:
         nround = NegotiationRound(round_number=round_number)
         new_statements: dict[Specialist, str] = {}
-        for specialist in specialists_list:
-            rivals = [s for s in specialists_list if s != specialist]
-            target = max(rivals, key=lambda s: claims[s].confidence)
-            rebuttal, usage = agents[specialist].make_rebuttal(incident, target, last_statement[target])
+        targets = {
+            specialist: max((s for s in specialists_list if s != specialist), key=lambda s: claims[s].confidence)
+            for specialist in specialists_list
+        }
+        with ThreadPoolExecutor(max_workers=len(specialists_list)) as executor:
+            rebuttal_results = list(
+                executor.map(
+                    lambda s: agents[s].make_rebuttal(incident, targets[s], last_statement[targets[s]]),
+                    specialists_list,
+                )
+            )
+        for specialist, (rebuttal, usage) in zip(specialists_list, rebuttal_results):
             nround.rebuttals.append(rebuttal)
             all_rebuttals.append(rebuttal)
             new_statements[specialist] = rebuttal.rebuttal
@@ -179,7 +196,8 @@ def run_negotiation(incident: Incident, contested_bids: list[Bid]) -> tuple[Reso
     usage_total = usage_total + usage
 
     if verdict.winner is not None:
-        diag, usage = agents[verdict.winner].diagnose(incident)
+        other_perspectives = [claim for specialist, claim in claims.items() if specialist != verdict.winner]
+        diag, usage = agents[verdict.winner].diagnose(incident, other_perspectives=other_perspectives)
         usage_total = usage_total + usage
         resolution = Resolution(
             outcome="consensus",

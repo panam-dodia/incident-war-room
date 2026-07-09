@@ -25,10 +25,20 @@ class Specialist(str, Enum):
     FRONTEND = "frontend"
 
 
+class ToolDefinition(BaseModel):
+    """One investigation action available on an incident -- like a dashboard or log
+    system a real engineer would go check. `description` is shown to the model (what
+    the tool does); `result` is the canned text returned when it's checked."""
+
+    description: str
+    result: str
+
+
 class Incident(BaseModel):
     id: str
     title: str
-    description: str
+    alert: str  # the short initial page/alert -- what everyone sees before investigating
+    tools: dict[Specialist, ToolDefinition] = Field(default_factory=dict)
     ground_truth_specialist: Specialist
     ground_truth_root_cause: str
     reference_remediation: str
@@ -40,6 +50,7 @@ class Bid(BaseModel):
     confidence: float = Field(ge=0, le=1)
     estimated_cost: float = Field(gt=0)
     reasoning: str
+    tool_checked: Optional[str] = None
 
     _coerce_reasoning = field_validator("reasoning", mode="before")(_coerce_text)
 
@@ -138,12 +149,14 @@ class RunResult(BaseModel):
     allocation: Optional[Allocation] = None
     resolution: Resolution
     usage: UsageStats
+    tools_checked: list[str] = Field(default_factory=list)
 
 
 class EvalResult(BaseModel):
     incident_id: str
     mode: Literal["multi_agent", "baseline"]
     root_cause_correct: bool
+    mechanism_correct: bool
     escalated: bool
     judge_score: float = Field(ge=0, le=5)
     usage: UsageStats
@@ -157,6 +170,7 @@ class EvalSummary(BaseModel):
     mode: Literal["multi_agent", "baseline"]
     incidents_scored: int
     accuracy: float
+    mechanism_accuracy: float
     coverage: float
     precision: float
     confidently_wrong_rate: float

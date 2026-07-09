@@ -147,5 +147,122 @@ class QwenClient:
         )
         return result, usage
 
+    def complete_with_tools(
+        self,
+        tier: str,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict],
+        tool_executor: Callable[[str, dict], str],
+        mock_fn: Callable[[], dict],
+        answer_schema: str,
+        max_tool_calls: int = 5,
+    ) -> tuple[dict, UsageStats, list[str]]:
+        """Real multi-turn tool-calling loop: the model can request tools (up to
+        max_tool_calls total invocations), each executed via tool_executor(name, args)
+        -> result text, until it stops requesting tools or the budget runs out. A final
+        call (no tools, JSON mode) then extracts the structured answer informed by
+        whatever it learned. Returns (result, usage, names_of_tools_actually_called).
+
+        In mock mode, returns mock_fn() directly with no tool calls -- the budget
+        mechanic only matters for testing real model behavior, not for demoing the
+        deterministic mock pipeline.
+        """
+        start = time.perf_counter()
+        model = self.model_for(tier)
+
+        if self.mock_mode:
+            result = mock_fn()
+            tokens = _estimate_tokens(system_prompt + user_prompt + json.dumps(result))
+            latency_ms = (time.perf_counter() - start) * 1000 + 60
+            usage = UsageStats(
+                tokens_used=tokens,
+                latency_ms=latency_ms,
+                estimated_cost_usd=tokens / 1000 * COST_PER_1K_TOKENS.get(model, 0.0008),
+                calls_made=1,
+            )
+            return result, usage, []
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        usage_total = UsageStats()
+        tools_called: list[str] = []
+        temperature = self.temperature_for(tier)
+
+        while len(tools_called) < max_tool_calls:
+            response = self._client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=temperature,
+            )
+            latency_ms = (time.perf_counter() - start) * 1000
+            usage_obj = response.usage
+            tokens = usage_obj.total_tokens if usage_obj else 0
+            usage_total = usage_total + UsageStats(
+                tokens_used=tokens,
+                latency_ms=latency_ms,
+                estimated_cost_usd=tokens / 1000 * COST_PER_1K_TOKENS.get(model, 0.0008),
+                calls_made=1,
+            )
+            msg = response.choices[0].message
+            requested = msg.tool_calls or []
+            if not requested:
+                break
+
+            messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
+                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in requested
+            ]})
+            for tc in requested:
+                if len(tools_called) >= max_tool_calls:
+                    result_text = "Investigation budget exhausted -- no more checks available before you must answer."
+                else:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    result_text = tool_executor(tc.function.name, args)
+                    tools_called.append(tc.function.name)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+
+        messages.append(
+            {
+                "role": "user",
+                "content": "Based on everything above, give your final answer now. Respond with a single "
+                "valid JSON object only, no prose, no markdown fences, matching exactly this shape:\n"
+                + answer_schema,
+            }
+        )
+        final_response = self._client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=temperature,
+        )
+        final_latency_ms = (time.perf_counter() - start) * 1000
+        content = final_response.choices[0].message.content or ""
+        final_usage_obj = final_response.usage
+        final_tokens = final_usage_obj.total_tokens if final_usage_obj else _estimate_tokens(content)
+        usage_total = usage_total + UsageStats(
+            tokens_used=final_tokens,
+            latency_ms=final_latency_ms,
+            estimated_cost_usd=final_tokens / 1000 * COST_PER_1K_TOKENS.get(model, 0.0008),
+            calls_made=1,
+        )
+
+        try:
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                parsed = {}
+        except json.JSONDecodeError:
+            parsed = {}
+        defaults = mock_fn()
+        result = {**defaults, **{k: v for k, v in parsed.items() if v is not None}}
+        return result, usage_total, tools_called
+
 
 qwen_client = QwenClient()

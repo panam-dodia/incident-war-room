@@ -36,7 +36,8 @@ def list_incidents():
         {
             "id": i.id,
             "title": i.title,
-            "description": i.description,
+            "alert": i.alert,
+            "tools": {s.value: t.description for s, t in i.tools.items()},
             "cross_cutting": i.cross_cutting,
             "ground_truth_specialist": i.ground_truth_specialist.value,
             "ground_truth_root_cause": i.ground_truth_root_cause,

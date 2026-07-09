@@ -45,7 +45,11 @@ async function init() {
 }
 
 function resetLivePanels(incident) {
-  el("incident-text").textContent = incident.description;
+  const toolList = Object.entries(incident.tools || {})
+    .map(([specialist, desc]) => `${specialist}: ${desc}`)
+    .join(" | ");
+  el("incident-text").innerHTML = `<div>${incident.alert}</div>` +
+    (toolList ? `<div style="margin-top:8px;color:var(--text-dim);font-size:12px;">Available tools — ${toolList}</div>` : "");
   el("bids").innerHTML = "";
   el("allocation").innerHTML = "";
   el("allocation").classList.add("empty");
@@ -68,6 +72,7 @@ function renderBids(bids) {
         <div class="specialist">${b.specialist}</div>
         <div class="metric">confidence <b>${fmt(b.confidence, 2)}</b> &middot; cost <b>${fmt(b.estimated_cost, 2)}</b></div>
         <div class="metric score">score ${fmt(score, 2)}</div>
+        ${b.tool_checked ? `<div class="metric" style="color:var(--teal-text);">✓ checked own dashboard</div>` : `<div class="metric" style="color:var(--text-dim);">no relevant dashboard</div>`}
         <div class="metric" style="margin-top:6px;">${b.reasoning}</div>
       </div>`;
     })
@@ -127,7 +132,9 @@ function renderResolution(resolution) {
 function renderBaseline(resolution) {
   const panel = el("baseline");
   panel.classList.remove("empty");
+  const checked = resolution.tools_checked || [];
   panel.innerHTML = `<p><b>Guess:</b> ${resolution.winning_specialist} &middot; <b>Confidence:</b> ${fmt(resolution.confidence, 2)}</p>
+    <p style="color:var(--text-dim);font-size:12px;">Investigated under a limited budget — checked: ${checked.length ? checked.join(", ") : "(none)"}</p>
     <p><b>Root cause:</b> ${resolution.root_cause}</p>
     <p><b>Remediation:</b> ${resolution.remediation}</p>`;
 }
@@ -198,12 +205,13 @@ function runSelectedIncident() {
 function summaryCard(title, summary) {
   return `<div class="summary-card">
     <h3>${title}</h3>
+    <div class="stat"><span>Domain accuracy (label only)</span><b>${fmt(summary.accuracy * 100, 1)}%</b></div>
+    <div class="stat"><span>Mechanism accuracy (actual explanation matches)</span><b>${fmt(summary.mechanism_accuracy * 100, 1)}%</b></div>
     <div class="stat"><span>Coverage (committed to an answer)</span><b>${fmt(summary.coverage * 100, 1)}%</b></div>
     <div class="stat"><span>Precision (correct when committed)</span><b>${fmt(summary.precision * 100, 1)}%</b></div>
     <div class="stat"><span>Confidently wrong</span><b>${fmt(summary.confidently_wrong_rate * 100, 1)}%</b></div>
     <div class="stat"><span>Escalated</span><b>${fmt(summary.escalation_rate * 100, 1)}%</b></div>
     <div class="stat"><span>Utility score (+1/0/-1)</span><b>${fmt(summary.utility_score, 3)}</b></div>
-    <div class="stat" style="color:var(--text-dim)"><span>Naive accuracy (escalated = wrong)</span><b>${fmt(summary.accuracy * 100, 1)}%</b></div>
     <div class="stat"><span>Avg judge score (/5)</span><b>${fmt(summary.avg_judge_score, 2)}</b></div>
     <div class="stat"><span>Total tokens</span><b>${summary.total_tokens}</b></div>
     <div class="stat"><span>Total latency</span><b>${fmt(summary.total_latency_ms, 0)} ms</b></div>
@@ -227,9 +235,10 @@ async function runFullEval() {
       summaryCard("Baseline (single generalist agent)", data.summary.baseline);
 
     const outcomeLabel = (cell) => {
-      if (cell.correct) return { cls: "pill-ok", text: `correct (${cell.outcome})` };
-      if (cell.outcome === "escalated") return { cls: "pill-escalated", text: "escalated" };
-      return { cls: "pill-bad", text: `confidently wrong (${cell.outcome})` };
+      if (!cell.correct && cell.outcome === "escalated") return { cls: "pill-escalated", text: "escalated" };
+      if (!cell.correct) return { cls: "pill-bad", text: `wrong domain (${cell.outcome})` };
+      if (!cell.mechanism_correct) return { cls: "pill-escalated", text: `right domain, wrong mechanism` };
+      return { cls: "pill-ok", text: `correct (${cell.outcome})` };
     };
 
     const rows = data.per_incident

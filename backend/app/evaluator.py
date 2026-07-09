@@ -1,12 +1,20 @@
 """Scores multi-agent vs baseline runs on root-cause accuracy, remediation
 quality (LLM-judge rubric), and cost/latency -- the measurable efficiency
-comparison the hackathon track asks for."""
+comparison the hackathon track asks for.
+
+Domain-label accuracy alone was found to hide a real gap: a system can name the
+right domain while fabricating the wrong specific mechanism (e.g. "networking"
+via a plausible-but-invented load-balancer story instead of the actual DNS TTL
+issue). mechanism_correct checks whether the produced explanation actually
+matches the real cause, not just the label.
+"""
 
 from __future__ import annotations
 
 from app.incidents import INCIDENTS
 from app.models import EvalResult, EvalSummary, Incident, Resolution, RunResult
 from app.orchestrator import run_baseline_run, run_multi_agent
+from app.qwen_client import qwen_client
 
 
 def _word_overlap(produced: str, reference: str) -> float:
@@ -28,13 +36,43 @@ def judge_score(incident: Incident, resolution: Resolution) -> float:
     return round(min(5.0, 1.0 + overlap * 4.0), 2)
 
 
+def check_mechanism(incident: Incident, resolution: Resolution) -> bool:
+    """Does the produced root cause name the same *specific* underlying mechanism
+    as the reference, not just the same domain label? A cheap, single check call --
+    proportionate since it only runs once per resolved incident during eval."""
+    if resolution.outcome == "escalated" or not resolution.root_cause:
+        return False
+
+    def mock() -> dict:
+        # Mock specialists literally return incident.ground_truth_root_cause verbatim
+        # when they're the correct domain, so an exact match is the right mock signal.
+        return {"matches": resolution.root_cause.strip() == incident.ground_truth_root_cause.strip()}
+
+    system_prompt = (
+        "You are checking whether a proposed incident root cause identifies the same "
+        "specific underlying mechanism as a reference root cause -- not just the same "
+        "general domain or symptom. A vague or fabricated explanation that happens to name "
+        "the right domain (e.g. blaming 'a load balancer misconfiguration' when the real "
+        "cause is a stale DNS TTL) does NOT match."
+    )
+    user_prompt = (
+        f"Reference root cause: {incident.ground_truth_root_cause}\n\n"
+        f"Proposed root cause: {resolution.root_cause}\n\n"
+        'Respond with JSON matching exactly this shape: {"matches": true or false}'
+    )
+    result, _usage = qwen_client.complete_json("bid", system_prompt, user_prompt, mock)
+    return bool(result.get("matches", False))
+
+
 def score_run(incident: Incident, run_result: RunResult) -> EvalResult:
     escalated = run_result.resolution.outcome == "escalated"
     correct = (not escalated) and run_result.resolution.winning_specialist == incident.ground_truth_specialist
+    mechanism_correct = correct and check_mechanism(incident, run_result.resolution)
     return EvalResult(
         incident_id=incident.id,
         mode=run_result.mode,
         root_cause_correct=correct,
+        mechanism_correct=mechanism_correct,
         escalated=escalated,
         judge_score=judge_score(incident, run_result.resolution),
         usage=run_result.usage,
@@ -57,18 +95,21 @@ def summarize(results: list[EvalResult], mode: str) -> EvalSummary:
       incident -- a single number that doesn't reward guessing and doesn't punish
       honest uncertainty as if it were a mistake. Symmetric weighting by design: this
       is a methodology choice, not tuned to favor either system.
-    - accuracy: kept for continuity/comparison with earlier runs, but should not be
-      read alone -- it scores escalation and confidently-wrong identically.
+    - accuracy: domain-label match only -- kept for continuity, but should not be read
+      alone. mechanism_accuracy is the stricter, more honest number: it requires the
+      actual explanation to match, not just the label.
     """
     subset = [r for r in results if r.mode == mode]
     n = len(subset) or 1
 
     correct_count = sum(1 for r in subset if r.root_cause_correct)
+    mechanism_correct_count = sum(1 for r in subset if r.mechanism_correct)
     escalated_count = sum(1 for r in subset if r.escalated)
     auto_resolved = [r for r in subset if not r.escalated]
     confidently_wrong_count = sum(1 for r in auto_resolved if not r.root_cause_correct)
 
     accuracy = correct_count / n
+    mechanism_accuracy = mechanism_correct_count / n
     coverage = len(auto_resolved) / n
     precision = (correct_count / len(auto_resolved)) if auto_resolved else 0.0
     confidently_wrong_rate = confidently_wrong_count / n
@@ -85,6 +126,7 @@ def summarize(results: list[EvalResult], mode: str) -> EvalSummary:
         mode=mode,
         incidents_scored=len(subset),
         accuracy=round(accuracy, 3),
+        mechanism_accuracy=round(mechanism_accuracy, 3),
         coverage=round(coverage, 3),
         precision=round(precision, 3),
         confidently_wrong_rate=round(confidently_wrong_rate, 3),
@@ -117,15 +159,19 @@ def run_full_eval(incidents: list[Incident] | None = None) -> dict:
                 "ground_truth_specialist": incident.ground_truth_specialist.value,
                 "multi_agent": {
                     "correct": ma_eval.root_cause_correct,
+                    "mechanism_correct": ma_eval.mechanism_correct,
                     "judge_score": ma_eval.judge_score,
                     "outcome": ma_run.resolution.outcome,
                     "tokens": ma_run.usage.tokens_used,
+                    "tools_checked": ma_run.tools_checked,
                 },
                 "baseline": {
                     "correct": bl_eval.root_cause_correct,
+                    "mechanism_correct": bl_eval.mechanism_correct,
                     "judge_score": bl_eval.judge_score,
                     "outcome": bl_run.resolution.outcome,
                     "tokens": bl_run.usage.tokens_used,
+                    "tools_checked": bl_run.tools_checked,
                 },
             }
         )

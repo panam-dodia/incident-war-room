@@ -12,6 +12,7 @@ decide the winner or who's contested.
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from app.models import Allocation, Bid, Incident, SanityCheck, Specialist, UsageStats
 from app.qwen_client import qwen_client
@@ -32,13 +33,26 @@ def conflict_threshold() -> float:
     return float(os.getenv("CONFLICT_CONFIDENCE_THRESHOLD", "0.10"))
 
 
+def contested_confidence_floor() -> float:
+    """A rival must also clear this absolute confidence bar to count as a genuine
+    contest -- being *numerically close* to the top bid isn't enough on its own.
+    Without this, an easy case whose top bid has unusually low confidence on one
+    sampling (pure noise, not a real signal) could let an equally low-confidence
+    rival look like a real dispute, when neither side is actually sure of anything.
+    Observed directly: inc-04 (an unambiguous frontend bug) spuriously escalated on
+    one real run despite normally winning outright at ~0.95 confidence."""
+    return float(os.getenv("CONTESTED_CONFIDENCE_FLOOR", "0.4"))
+
+
 def collect_bids(incident: Incident) -> tuple[list[Bid], UsageStats]:
-    """Every specialist independently bids: confidence plus an estimated cost."""
-    bids: list[Bid] = []
+    """Every specialist independently bids: confidence plus an estimated cost. Run
+    concurrently -- each specialist checks their own domain, so there's no reason
+    to make one wait on another; that's the whole point of dividing the work."""
     usage_total = UsageStats()
-    for agent in SPECIALIST_AGENTS.values():
-        bid, usage = agent.bid(incident)
-        bids.append(bid)
+    with ThreadPoolExecutor(max_workers=len(SPECIALIST_AGENTS)) as executor:
+        results = list(executor.map(lambda agent: agent.bid(incident), SPECIALIST_AGENTS.values()))
+    bids = [bid for bid, _ in results]
+    for _, usage in results:
         usage_total = usage_total + usage
     return bids, usage_total
 
@@ -47,10 +61,11 @@ def allocate(bids: list[Bid]) -> Allocation:
     ranked = sorted(bids, key=lambda b: b.confidence, reverse=True)
     top = ranked[0]
     threshold = conflict_threshold()
+    floor = contested_confidence_floor()
 
     contested_specialists = [top.specialist]
     for bid in ranked[1:]:
-        if top.confidence - bid.confidence <= threshold:
+        if top.confidence - bid.confidence <= threshold and bid.confidence >= floor:
             contested_specialists.append(bid.specialist)
 
     contested = len(contested_specialists) > 1
@@ -78,9 +93,12 @@ def sanity_check(
         )
         return {"plausible": plausible, "reasoning": reasoning}
 
+    tool = incident.tools.get(specialist)
+    evidence_text = tool.result if tool else "No specific monitoring data was available in this domain."
     user_prompt = (
-        f"Incident: {incident.title}\n\n{incident.description}\n\n"
+        f"Incident alert: {incident.alert}\n\n"
         f"Specialist: {specialist.value}\n"
+        f"Their domain's monitoring data: {evidence_text}\n\n"
         f"Proposed root cause: {root_cause}\n"
         f"Proposed remediation: {remediation}\n\n"
         "Respond with JSON matching exactly this shape:\n"
