@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-from app.models import Allocation, Bid, Incident, SanityCheck, Specialist, UsageStats
+from app.models import Allocation, Bid, Claim, Incident, SanityCheck, Specialist, UsageStats
 from app.qwen_client import qwen_client
 from app.specialists import SPECIALIST_AGENTS
 
@@ -22,8 +22,12 @@ SANITY_CHECK_PERSONA = (
     "You are a skeptical incident-review checker. A single specialist proposed this root cause "
     "and remediation with no rival specialist close enough in confidence to trigger a debate -- "
     "so nobody has challenged it yet. Check whether the proposed root cause is genuinely "
-    "supported by the concrete evidence in the incident description, or whether it's a mismatch, "
-    "an unsupported guess, or plausibly the wrong domain entirely."
+    "supported by the specialist's own domain monitoring data, or whether it's a mismatch, "
+    "an unsupported guess, or plausibly the wrong domain entirely. If another specialist's own "
+    "domain findings (shown below, when present) point to a more proximate or better-supported "
+    "cause than the one proposed, mark the proposed diagnosis as not plausible and say why -- "
+    "a self-consistent story can still be the wrong one if someone else's evidence explains the "
+    "incident more directly."
 )
 
 
@@ -78,11 +82,24 @@ def allocate(bids: list[Bid]) -> Allocation:
 
 
 def sanity_check(
-    incident: Incident, specialist: Specialist, root_cause: str, remediation: str
+    incident: Incident,
+    specialist: Specialist,
+    root_cause: str,
+    remediation: str,
+    other_perspectives: list[Claim] | None = None,
 ) -> tuple[SanityCheck, UsageStats]:
-    """One cheap, independent check on an uncontested clear-winner diagnosis. Uses the
-    fast/cheap 'bid' model tier deliberately -- this must stay proportionate to a fast
-    path that exists specifically because most incidents don't need a full debate."""
+    """One cheap, independent check on an uncontested clear-winner (or negotiated
+    consensus) diagnosis. Uses the fast/cheap 'bid' model tier deliberately -- this
+    must stay proportionate to a fast path that exists specifically because most
+    incidents don't need a full debate.
+
+    other_perspectives carries other specialists' own domain findings that weren't
+    confident/close enough to trigger a contest -- without this, the check could only
+    ask "is this self-consistent with the winner's own evidence," and had no way to
+    catch a case where a *different* specialist's own monitoring told a more direct
+    story the winner never saw (observed directly: a specialist under-rated its own
+    correct finding because it wasn't "its own team's fault," letting a plausible but
+    less-proximate rival win outright with nothing to catch it)."""
 
     def mock() -> dict:
         plausible = specialist == incident.ground_truth_specialist
@@ -95,10 +112,15 @@ def sanity_check(
 
     tool = incident.tools.get(specialist)
     evidence_text = tool.result if tool else "No specific monitoring data was available in this domain."
+    other_text = ""
+    if other_perspectives:
+        other_text = "\n\nOther specialists' own domain findings (not part of the proposed diagnosis):\n" + "\n".join(
+            f"- [{p.specialist.value}] {p.claim} (evidence: {'; '.join(p.evidence)})" for p in other_perspectives
+        )
     user_prompt = (
         f"Incident alert: {incident.alert}\n\n"
         f"Specialist: {specialist.value}\n"
-        f"Their domain's monitoring data: {evidence_text}\n\n"
+        f"Their domain's monitoring data: {evidence_text}{other_text}\n\n"
         f"Proposed root cause: {root_cause}\n"
         f"Proposed remediation: {remediation}\n\n"
         "Respond with JSON matching exactly this shape:\n"

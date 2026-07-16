@@ -9,11 +9,14 @@ credentials, and swapping to real Qwen Cloud later is just setting env vars.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Callable
 
 from app.models import UsageStats
+
+logger = logging.getLogger(__name__)
 
 MODEL_ENV = {
     "bid": "QWEN_MODEL_BID",
@@ -58,6 +61,33 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _log_api_failure(tier: str, model: str, exc: Exception) -> None:
+    """Falling back to mock() is the same either way, but the log severity should
+    tell an operator whether this will keep happening (a broken key/quota -- needs
+    a human) or was probably a one-off blip that the SDK's own retries already
+    tried to ride out (rate limit/connection/5xx, exhausted after 3 attempts)."""
+    from openai import APIConnectionError, InternalServerError, RateLimitError
+
+    transient = isinstance(exc, (RateLimitError, APIConnectionError, InternalServerError))
+    level = logging.WARNING if transient else logging.ERROR
+    logger.log(
+        level,
+        "Qwen API call failed (tier=%s, model=%s)%s: %s -- falling back to mock response",
+        tier, model, " after exhausting retries" if transient else "", exc,
+    )
+
+
+def _mock_usage(model: str, system_prompt: str, user_prompt: str, result: dict, start: float) -> UsageStats:
+    tokens = _estimate_tokens(system_prompt + user_prompt + json.dumps(result))
+    latency_ms = (time.perf_counter() - start) * 1000 + 60
+    return UsageStats(
+        tokens_used=tokens,
+        latency_ms=latency_ms,
+        estimated_cost_usd=tokens / 1000 * COST_PER_1K_TOKENS.get(model, 0.0008),
+        calls_made=1,
+    )
+
+
 class QwenClient:
     def __init__(self) -> None:
         self.api_key = os.getenv("QWEN_API_KEY", "").strip()
@@ -73,7 +103,13 @@ class QwenClient:
                     "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 ),
                 timeout=120.0,  # real reasoning-heavy calls can take 60-100s+; still far short of the SDK's 600s default
-                max_retries=1,
+                # The SDK already knows which failures are retryable (connection errors,
+                # timeouts, 429 rate limits, 5xx) vs not (401/400/403/404/422, which it never
+                # retries), and applies its own backoff/Retry-After handling -- no need to
+                # hand-roll that. 3, not the default 2, because a parallelized batch run can
+                # have several specialist/judge calls hit a rate limit at the same moment, and
+                # one retry isn't always enough for the window to clear.
+                max_retries=3,
             )
 
     def model_for(self, tier: str) -> str:
@@ -96,30 +132,30 @@ class QwenClient:
 
         if self.mock_mode:
             result = mock_fn()
-            tokens = _estimate_tokens(system_prompt + user_prompt + json.dumps(result))
             # small synthetic delay so live-streamed demos don't feel instantaneous/fake
-            latency_ms = (time.perf_counter() - start) * 1000 + 60
-            usage = UsageStats(
-                tokens_used=tokens,
-                latency_ms=latency_ms,
-                estimated_cost_usd=tokens / 1000 * COST_PER_1K_TOKENS.get(model, 0.0008),
-                calls_made=1,
-            )
-            return result, usage
+            return result, _mock_usage(model, system_prompt, user_prompt, result, start)
 
-        response = self._client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                    + "\nRespond with a single valid JSON object only, no prose, no markdown fences.",
-                },
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=self.temperature_for(tier),
-        )
+        from openai import OpenAIError
+
+        try:
+            response = self._client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                        + "\nRespond with a single valid JSON object only, no prose, no markdown fences.",
+                    },
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=self.temperature_for(tier),
+            )
+        except OpenAIError as exc:
+            _log_api_failure(tier, model, exc)
+            result = mock_fn()
+            return result, _mock_usage(model, system_prompt, user_prompt, result, start)
+
         latency_ms = (time.perf_counter() - start) * 1000
         content = response.choices[0].message.content or ""
 
@@ -173,16 +209,33 @@ class QwenClient:
 
         if self.mock_mode:
             result = mock_fn()
-            tokens = _estimate_tokens(system_prompt + user_prompt + json.dumps(result))
-            latency_ms = (time.perf_counter() - start) * 1000 + 60
-            usage = UsageStats(
-                tokens_used=tokens,
-                latency_ms=latency_ms,
-                estimated_cost_usd=tokens / 1000 * COST_PER_1K_TOKENS.get(model, 0.0008),
-                calls_made=1,
-            )
-            return result, usage, []
+            return result, _mock_usage(model, system_prompt, user_prompt, result, start), []
 
+        from openai import OpenAIError
+
+        try:
+            return self._complete_with_tools_real(
+                tier, system_prompt, user_prompt, tools, tool_executor, mock_fn, answer_schema,
+                max_tool_calls, model, start,
+            )
+        except OpenAIError as exc:
+            _log_api_failure(tier, model, exc)
+            result = mock_fn()
+            return result, _mock_usage(model, system_prompt, user_prompt, result, start), []
+
+    def _complete_with_tools_real(
+        self,
+        tier: str,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict],
+        tool_executor: Callable[[str, dict], str],
+        mock_fn: Callable[[], dict],
+        answer_schema: str,
+        max_tool_calls: int,
+        model: str,
+        start: float,
+    ) -> tuple[dict, UsageStats, list[str]]:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

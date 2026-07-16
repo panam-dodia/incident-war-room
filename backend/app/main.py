@@ -19,6 +19,7 @@ from app.evaluator import run_full_eval
 from app.incidents import INCIDENTS, get_incident
 from app.orchestrator import run_baseline_run, run_multi_agent
 from app.qwen_client import qwen_client
+from app.validation_history import historical_summary
 
 app = FastAPI(title="Incident War Room")
 
@@ -49,6 +50,14 @@ def list_incidents():
 @app.post("/api/eval/run")
 def eval_run():
     return run_full_eval()
+
+
+@app.get("/api/eval/history")
+def eval_history():
+    """Static snapshots of past real Qwen Cloud full-batch runs -- shows the
+    accuracy/cost gap was checked repeatedly, not just on whatever run happens
+    to be live right now."""
+    return historical_summary()
 
 
 @app.websocket("/ws/run/{incident_id}")

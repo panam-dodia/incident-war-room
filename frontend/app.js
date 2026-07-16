@@ -42,6 +42,29 @@ async function init() {
   if (state.incidents.length) {
     select.value = state.incidents.find((i) => i.cross_cutting)?.id || state.incidents[0].id;
   }
+
+  loadEvalHistory();
+}
+
+async function loadEvalHistory() {
+  try {
+    const h = await fetch("/api/eval/history").then((r) => r.json());
+    const pct = (spread) => `${fmt(spread.min * 100, 1)}-${fmt(spread.max * 100, 1)}% (mean ${fmt(spread.mean * 100, 1)}%)`;
+    const x = (spread) => `${fmt(spread.min, 1)}-${fmt(spread.max, 1)}x`;
+    el("eval-history").innerHTML = `
+      <h3>Validated across ${h.num_runs} real Qwen Cloud runs</h3>
+      <p style="color:var(--text-dim);font-size:12px;">
+        Not a single lucky run -- these are frozen snapshots of ${h.num_runs} independent full-batch
+        evaluations against real Qwen Cloud, on the current tool-budget architecture.
+      </p>
+      <div class="stat"><span>Multi-agent mechanism accuracy</span><b>${pct(h.per_mode.multi_agent.mechanism_accuracy)}</b></div>
+      <div class="stat"><span>Baseline mechanism accuracy</span><b>${pct(h.per_mode.baseline.mechanism_accuracy)}</b></div>
+      <div class="stat"><span>Token premium</span><b>${x(h.token_premium)}</b></div>
+      <div class="stat"><span>Cost premium</span><b>${x(h.cost_premium)}</b></div>
+    `;
+  } catch (e) {
+    el("eval-history").innerHTML = "";
+  }
 }
 
 function resetLivePanels(incident) {

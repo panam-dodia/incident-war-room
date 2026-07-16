@@ -96,9 +96,14 @@ class SpecialistAgent:
         system_prompt = (
             self.persona
             + " You've already checked your own domain's monitoring as part of your normal "
-            "workflow (shown below). Return your confidence (0-1) that this incident's root "
-            "cause is in your domain, an estimated_cost (relative effort units, 0.5-2.0) to "
-            "investigate further, and a one-sentence reasoning referencing what you found."
+            "workflow (shown below). Return your confidence (0-1) that YOUR data explains the "
+            "actual root cause of this incident -- even if the underlying fault turns out to be "
+            "an external dependency or another team's system: if your own monitoring is what "
+            "reveals it, that counts fully as your domain. Do not lower your confidence just "
+            "because the fault isn't your own team's infrastructure; score based on how clearly "
+            "your data explains what's happening. Also return an estimated_cost (relative effort "
+            "units, 0.5-2.0) to investigate further, and a one-sentence reasoning referencing "
+            "what you found."
         )
         user_prompt = (
             f"Incident alert: {incident.alert}\n\nYour domain's monitoring data: {tool_result}\n\n"
